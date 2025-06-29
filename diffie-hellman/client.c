@@ -1,146 +1,114 @@
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
 #include <openssl/bn.h>
-#include "diffie_hellman.h"
-
-#pragma comment(lib, "ws2_32.lib")
+#include "diffie-hellman.h"
 
 #define SERVER_IP "127.0.0.1"
 #define PORT 8080
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 1024
+
+void print_hex(const char *label, const BIGNUM *num) {
+    char *hex = BN_bn2hex(num);
+    printf("%s: %s\n", label, hex);
+    OPENSSL_free(hex);
+}
 
 int main() {
-    WSADATA wsaData;
-    SOCKET client_socket;
+    int client_socket;
     struct sockaddr_in server_addr;
     
-    // 初始化Winsock
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        fprintf(stderr, "WSAStartup failed: %d\n", WSAGetLastError());
-        return 1;
-    }
-    
     // 创建套接字
-    if ((client_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET) {
-        fprintf(stderr, "Socket creation failed: %d\n", WSAGetLastError());
-        WSACleanup();
-        return 1;
+    if ((client_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("Socket creation error");
+        exit(EXIT_FAILURE);
     }
     
     // 配置服务器地址
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
     if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
-        fprintf(stderr, "Invalid address: %d\n", WSAGetLastError());
-        closesocket(client_socket);
-        WSACleanup();
-        return 1;
+        perror("Invalid address/Address not supported");
+        exit(EXIT_FAILURE);
     }
     
-    // 连接服务器
-    if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
-        fprintf(stderr, "Connection failed: %d\n", WSAGetLastError());
-        closesocket(client_socket);
-        WSACleanup();
-        return 1;
+    // 连接到服务器
+    if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Connection failed");
+        exit(EXIT_FAILURE);
     }
     
-    printf("Connected to server\n");
+    printf("Connected to server at %s:%d\n", SERVER_IP, PORT);
     
-    // 接收DH参数
-    char params_buffer[BUFFER_SIZE * 2];
-    int recv_len = recv(client_socket, params_buffer, sizeof(params_buffer) - 1, 0);
-    if (recv_len <= 0) {
-        fprintf(stderr, "Receive parameters failed: %d\n", WSAGetLastError());
-        closesocket(client_socket);
-        WSACleanup();
-        return 1;
-    }
-    params_buffer[recv_len] = '\0';
+    // 生成DH参数(实际应用中应使用固定安全参数)
+    BIGNUM *p = BN_new();
+    BIGNUM *g = BN_new();
+    BN_hex2bn(&p, "e6f03f6f711b0c24ff7afe3605a17ab3a11d3e075483aa211958d903f2b41b4b6a6ea1c19bf3144b28ae2575fabe896b1c72b3775a81b3f341ab1ec1adf34f2b"); // 示例使用小素数
+    BN_set_word(g, 2);  // 使用2作为生成元
     
-    // 解析参数
-    char *p_hex = strtok(params_buffer, "\n");
-    char *g_hex = strtok(NULL, "\n");
-    
-    if (!p_hex || !g_hex) {
-        fprintf(stderr, "Invalid parameter format\n");
-        closesocket(client_socket);
-        WSACleanup();
-        return 1;
-    }
-    
-    BIGNUM *p = NULL, *g = NULL;
-    if (dh_deserialize_key(p_hex, strlen(p_hex), &p) != 0 || 
-        dh_deserialize_key(g_hex, strlen(g_hex), &g) != 0) {
-        fprintf(stderr, "Invalid DH parameters\n");
-        closesocket(client_socket);
-        WSACleanup();
-        return 1;
-    }
-    
-    // 初始化会话
+    // 初始化DH会话
     DHSession session;
-    memset(&session, 0, sizeof(session));
     if (dh_session_init(&session, p, g) != 0) {
-        fprintf(stderr, "Session initialization failed\n");
-        BN_free(p);
-        BN_free(g);
-        closesocket(client_socket);
-        WSACleanup();
-        return 1;
+        fprintf(stderr, "Failed to initialize DH session\n");
+        close(client_socket);
+        exit(EXIT_FAILURE);
     }
     
-    // 发送客户端公钥
-    char client_pub_hex[BUFFER_SIZE];
-    dh_serialize_key(session.public_key, client_pub_hex, sizeof(client_pub_hex));
-    send(client_socket, client_pub_hex, (int)strlen(client_pub_hex), 0);
+    print_hex("Client private key", session.private_key);
+    // print_hex("Client public key", session.public_key);
+    
+    // 序列化并发送公钥
+    char buffer[BUFFER_SIZE];
+    int len = dh_serialize_key(session.public_key, buffer, sizeof(buffer));
+    if (send(client_socket, buffer, len, 0) != len) {
+        perror("Send failed");
+        dh_session_clear(&session);
+        close(client_socket);
+        exit(EXIT_FAILURE);
+    }
+    
+    printf("Sent public key to server\n");
     
     // 接收服务器公钥
-    char server_pub_buffer[BUFFER_SIZE];
-    recv_len = recv(client_socket, server_pub_buffer, sizeof(server_pub_buffer) - 1, 0);
-    if (recv_len <= 0) {
-        fprintf(stderr, "Receive server public key failed: %d\n", WSAGetLastError());
+    len = recv(client_socket, buffer, sizeof(buffer), 0);
+    if (len <= 0) {
+        perror("Receive failed");
         dh_session_clear(&session);
-        BN_free(p);
-        BN_free(g);
-        closesocket(client_socket);
-        WSACleanup();
-        return 1;
+        close(client_socket);
+        exit(EXIT_FAILURE);
     }
-    server_pub_buffer[recv_len] = '\0';
     
-    BIGNUM *server_pub = NULL;
-    if (dh_deserialize_key(server_pub_buffer, recv_len, &server_pub) != 0) {
-        fprintf(stderr, "Invalid server public key\n");
+    BIGNUM *server_pubkey = BN_new();
+    if (dh_deserialize_key(buffer, len, server_pubkey) != 0) {
+        fprintf(stderr, "Failed to deserialize server public key\n");
+        BN_free(server_pubkey);
         dh_session_clear(&session);
-        BN_free(p);
-        BN_free(g);
-        closesocket(client_socket);
-        WSACleanup();
-        return 1;
+        close(client_socket);
+        exit(EXIT_FAILURE);
     }
+    
+    print_hex("Received server public key", server_pubkey);
     
     // 计算共享密钥
-    if (dh_compute_shared_secret(&session, server_pub) == 0) {
-        char *shared_hex = BN_bn2hex(session.shared_secret);
-        printf("Shared secret: %s\n", shared_hex);
-        OPENSSL_free(shared_hex);
-    } else {
-        fprintf(stderr, "Shared secret computation failed\n");
+    if (dh_compute_shared_secret(&session, server_pubkey) != 0) {
+        fprintf(stderr, "Failed to compute shared secret\n");
+        BN_free(server_pubkey);
+        dh_session_clear(&session);
+        close(client_socket);
+        exit(EXIT_FAILURE);
     }
     
-    // 清理资源
-    BN_free(server_pub);
+    print_hex("Shared secret", session.shared_secret);
+    
+    // 清理
+    BN_free(server_pubkey);
     BN_free(p);
     BN_free(g);
     dh_session_clear(&session);
-    closesocket(client_socket);
-    WSACleanup();
+    close(client_socket);
     
+    printf("Client exiting...\n");
     return 0;
 }

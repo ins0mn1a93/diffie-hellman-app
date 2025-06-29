@@ -1,173 +1,189 @@
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <pthread.h>
 #include <openssl/bn.h>
-#include "diffie_hellman.h"
-
-#pragma comment(lib, "ws2_32.lib")
+#include "diffie-hellman.h"
 
 #define PORT 8080
-#define BUFFER_SIZE 4096
-#define DH_BITS 2048
+#define BUFFER_SIZE 1024
 
 typedef struct {
-    SOCKET client_socket;
+    int client_socket;
     struct sockaddr_in client_addr;
-} ThreadParams;
+} thread_data_t;
 
-DWORD WINAPI handle_client(LPVOID arg) {
-    ThreadParams *params = (ThreadParams *)arg;
-    SOCKET client_socket = params->client_socket;
-    
+void print_hex(const char *label, const BIGNUM *num) {
+    char *hex = BN_bn2hex(num);
+    printf("%s: %s\n", label, hex);
+    OPENSSL_free(hex);
+}
+
+void *handle_client(void *arg) {
+    thread_data_t *data = (thread_data_t *)arg;
+    int client_socket = data->client_socket;
     char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(params->client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
     
-    printf("Thread %lu handling client %s:%d\n", 
-           GetCurrentThreadId(), 
-           client_ip,
-           ntohs(params->client_addr.sin_port));
+    inet_ntop(AF_INET, &(data->client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+    printf("Client connected from %s:%d\n", client_ip, ntohs(data->client_addr.sin_port));
     
-    // 生成DH参数
-    BIGNUM *p = NULL, *g = NULL;
-    dh_generate_parameters(DH_BITS, &p, &g);
+    // 生成DH参数(应与客户端使用相同参数)
+    BIGNUM *p = BN_new();
+    BIGNUM *g = BN_new();
+    BN_hex2bn(&p, "e6f03f6f711b0c24ff7afe3605a17ab3a11d3e075483aa211958d903f2b41b4b6a6ea1c19bf3144b28ae2575fabe896b1c72b3775a81b3f341ab1ec1adf34f2b"); // 示例使用小素数
+    BN_set_word(g, 2);  // 使用2作为生成元
+
     
-    // 初始化会话
+    // 初始化DH会话（添加详细检查）
     DHSession session;
-    memset(&session, 0, sizeof(session));
+    memset(&session, 0, sizeof(DHSession)); // 显式初始化
+    
     if (dh_session_init(&session, p, g) != 0) {
-        fprintf(stderr, "Session initialization failed\n");
-        closesocket(client_socket);
-        free(params);
-        return 1;
+        fprintf(stderr, "DH session init failed. Cleaning up...\n");
+        BN_free(p);
+        BN_free(g);
+        close(client_socket);
+        free(data);
+        return NULL;
+    }
+
+    // 打印前验证指针
+    if (!session.public_key) {
+        fprintf(stderr, "Critical: public_key is NULL after init!\n");
+        dh_session_clear(&session);
+        BN_free(p);
+        BN_free(g);
+        close(client_socket);
+        free(data);
+        return NULL;
     }
     
-    // 发送DH参数
-    char p_hex[BUFFER_SIZE], g_hex[BUFFER_SIZE];
-    dh_serialize_key(p, p_hex, sizeof(p_hex));
-    dh_serialize_key(g, g_hex, sizeof(g_hex));
-    
-    char params_msg[BUFFER_SIZE * 2];
-    snprintf(params_msg, sizeof(params_msg), "%s\n%s", p_hex, g_hex);
-    send(client_socket, params_msg, (int)strlen(params_msg), 0);
+    print_hex("Server private key", session.private_key);
+    print_hex("Server public key", session.public_key);
     
     // 接收客户端公钥
     char buffer[BUFFER_SIZE];
-    int recv_len = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-    if (recv_len <= 0) {
-        fprintf(stderr, "Receive client public key failed: %d\n", WSAGetLastError());
+    int len = recv(client_socket, buffer, sizeof(buffer), 0);
+    if (len <= 0) {
+        perror("Receive failed");
         dh_session_clear(&session);
-        closesocket(client_socket);
-        free(params);
-        return 1;
+        close(client_socket);
+        free(data);
+        return NULL;
     }
-    buffer[recv_len] = '\0';
     
-    BIGNUM *client_pub = NULL;
-    if (dh_deserialize_key(buffer, recv_len, &client_pub) != 0) {
-        fprintf(stderr, "Invalid client public key\n");
+    BIGNUM *client_pubkey = BN_new();
+    if (dh_deserialize_key(buffer, len, client_pubkey) != 0) {
+        fprintf(stderr, "Failed to deserialize client public key\n");
+        BN_free(client_pubkey);
         dh_session_clear(&session);
-        closesocket(client_socket);
-        free(params);
-        return 1;
+        close(client_socket);
+        free(data);
+        return NULL;
     }
+    
+    print_hex("Received client public key", client_pubkey);
     
     // 发送服务器公钥
-    char server_pub_hex[BUFFER_SIZE];
-    dh_serialize_key(session.public_key, server_pub_hex, sizeof(server_pub_hex));
-    send(client_socket, server_pub_hex, (int)strlen(server_pub_hex), 0);
-    
-    // 计算共享密钥
-    if (dh_compute_shared_secret(&session, client_pub) == 0) {
-        char *shared_hex = BN_bn2hex(session.shared_secret);
-        printf("Shared secret: %s\n", shared_hex);
-        OPENSSL_free(shared_hex);
-    } else {
-        fprintf(stderr, "Shared secret computation failed\n");
+    len = dh_serialize_key(session.public_key, buffer, sizeof(buffer));
+    if (send(client_socket, buffer, len, 0) != len) {
+        perror("Send failed");
+        BN_free(client_pubkey);
+        dh_session_clear(&session);
+        close(client_socket);
+        free(data);
+        return NULL;
     }
     
-    // 清理资源
-    BN_free(client_pub);
+    printf("Sent public key to client\n");
+    
+    // 计算共享密钥
+    if (dh_compute_shared_secret(&session, client_pubkey) != 0) {
+        fprintf(stderr, "Failed to compute shared secret\n");
+        BN_free(client_pubkey);
+        dh_session_clear(&session);
+        close(client_socket);
+        free(data);
+        return NULL;
+    }
+    
+    print_hex("Shared secret", session.shared_secret);
+    
+    // 清理
+    BN_free(client_pubkey);
     BN_free(p);
     BN_free(g);
     dh_session_clear(&session);
-    closesocket(client_socket);
-    free(params);
+    close(client_socket);
+    free(data);
     
-    printf("Thread %lu finished\n", GetCurrentThreadId());
-    return 0;
+    printf("Client %s:%d disconnected\n", client_ip, ntohs(data->client_addr.sin_port));
+    return NULL;
 }
 
 int main() {
-    WSADATA wsaData;
-    SOCKET server_socket;
-    struct sockaddr_in server_addr;
-    
-    // 初始化Winsock
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        fprintf(stderr, "WSAStartup failed: %d\n", WSAGetLastError());
-        return 1;
-    }
+    int server_socket, client_socket;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
     
     // 创建套接字
-    if ((server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET) {
-        fprintf(stderr, "Socket creation failed: %d\n", WSAGetLastError());
-        WSACleanup();
-        return 1;
+    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("Socket creation error");
+        exit(EXIT_FAILURE);
     }
     
-    // 配置服务器
+    // 配置服务器地址
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
     
-    // 绑定和监听
-    if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
-        fprintf(stderr, "Bind failed: %d\n", WSAGetLastError());
-        closesocket(server_socket);
-        WSACleanup();
-        return 1;
+    // 绑定套接字
+    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        exit(EXIT_FAILURE);
     }
     
-    if (listen(server_socket, SOMAXCONN) == SOCKET_ERROR) {
-        fprintf(stderr, "Listen failed: %d\n", WSAGetLastError());
-        closesocket(server_socket);
-        WSACleanup();
-        return 1;
+    // 监听连接
+    if (listen(server_socket, 5) < 0) {
+        perror("Listen failed");
+        exit(EXIT_FAILURE);
     }
     
-    printf("Server listening on port %d\n", PORT);
+    printf("Server listening on port %d...\n", PORT);
     
-    // 主循环
     while (1) {
-        struct sockaddr_in client_addr;
-        int client_addr_len = sizeof(client_addr);
-        SOCKET client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);
-        if (client_socket == INVALID_SOCKET) {
-            fprintf(stderr, "Accept failed: %d\n", WSAGetLastError());
+        // 接受新连接
+        client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
+        if (client_socket < 0) {
+            perror("Accept failed");
             continue;
         }
         
-        // 创建线程参数
-        ThreadParams *params = (ThreadParams *)malloc(sizeof(ThreadParams));
-        params->client_socket = client_socket;
-        memcpy(&params->client_addr, &client_addr, sizeof(client_addr));
-        
-        // 创建线程
-        HANDLE thread = CreateThread(NULL, 0, handle_client, params, 0, NULL);
-        if (thread == NULL) {
-            fprintf(stderr, "Thread creation failed: %d\n", GetLastError());
-            closesocket(client_socket);
-            free(params);
-        } else {
-            CloseHandle(thread); // 不需要保持句柄
+        // 为每个客户端创建线程
+        pthread_t thread_id;
+        thread_data_t *data = malloc(sizeof(thread_data_t));
+        if (!data) {
+            perror("Memory allocation failed");
+            close(client_socket);
+            continue;
         }
+        
+        data->client_socket = client_socket;
+        memcpy(&data->client_addr, &client_addr, sizeof(client_addr));
+        
+        if (pthread_create(&thread_id, NULL, handle_client, data) != 0) {
+            perror("Thread creation failed");
+            free(data);
+            close(client_socket);
+            continue;
+        }
+        
+        // 分离线程，使其结束后自动释放资源
+        pthread_detach(thread_id);
     }
     
-    closesocket(server_socket);
-    WSACleanup();
+    close(server_socket);
     return 0;
 }
