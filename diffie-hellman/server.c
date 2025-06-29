@@ -15,60 +15,43 @@ typedef struct {
     struct sockaddr_in client_addr;
 } thread_data_t;
 
-void print_hex(const char *label, const BIGNUM *num) {
-    char *hex = BN_bn2hex(num);
-    printf("%s: %s\n", label, hex);
-    OPENSSL_free(hex);
-}
-
 void *handle_client(void *arg) {
     thread_data_t *data = (thread_data_t *)arg;
     int client_socket = data->client_socket;
     char client_ip[INET_ADDRSTRLEN];
     
     inet_ntop(AF_INET, &(data->client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-    printf("Client connected from %s:%d\n", client_ip, ntohs(data->client_addr.sin_port));
+    printf("Client connected: %s\n", client_ip);
     
-    // 生成DH参数(应与客户端使用相同参数)
-    BIGNUM *p = BN_new();
-    BIGNUM *g = BN_new();
-    BN_hex2bn(&p, "e6f03f6f711b0c24ff7afe3605a17ab3a11d3e075483aa211958d903f2b41b4b6a6ea1c19bf3144b28ae2575fabe896b1c72b3775a81b3f341ab1ec1adf34f2b"); // 示例使用小素数
-    BN_set_word(g, 2);  // 使用2作为生成元
-
+    // 动态生成DH参数
+    BIGNUM *p = NULL;
+    BIGNUM *g = NULL;
+    if (dh_generate_parameters(2048, &p, &g) != 0) {
+        fprintf(stderr, "Failed to generate DH parameters\n");
+        close(client_socket);
+        free(data);
+        return NULL;
+    }
     
-    // 初始化DH会话（添加详细检查）
+    // 初始化DH会话
     DHSession session;
-    memset(&session, 0, sizeof(DHSession)); // 显式初始化
-    
     if (dh_session_init(&session, p, g) != 0) {
-        fprintf(stderr, "DH session init failed. Cleaning up...\n");
+        fprintf(stderr, "DH session init failed\n");
         BN_free(p);
         BN_free(g);
         close(client_socket);
         free(data);
         return NULL;
     }
-
-    // 打印前验证指针
-    if (!session.public_key) {
-        fprintf(stderr, "Critical: public_key is NULL after init!\n");
-        dh_session_clear(&session);
-        BN_free(p);
-        BN_free(g);
-        close(client_socket);
-        free(data);
-        return NULL;
-    }
-    
-    print_hex("Server private key", session.private_key);
-    print_hex("Server public key", session.public_key);
     
     // 接收客户端公钥
     char buffer[BUFFER_SIZE];
     int len = recv(client_socket, buffer, sizeof(buffer), 0);
     if (len <= 0) {
-        perror("Receive failed");
+        perror("Receive public key failed");
         dh_session_clear(&session);
+        BN_free(p);
+        BN_free(g);
         close(client_socket);
         free(data);
         return NULL;
@@ -76,40 +59,49 @@ void *handle_client(void *arg) {
     
     BIGNUM *client_pubkey = BN_new();
     if (dh_deserialize_key(buffer, len, client_pubkey) != 0) {
-        fprintf(stderr, "Failed to deserialize client public key\n");
+        fprintf(stderr, "Deserialize client key failed\n");
         BN_free(client_pubkey);
         dh_session_clear(&session);
+        BN_free(p);
+        BN_free(g);
         close(client_socket);
         free(data);
         return NULL;
     }
-    
-    print_hex("Received client public key", client_pubkey);
     
     // 发送服务器公钥
     len = dh_serialize_key(session.public_key, buffer, sizeof(buffer));
-    if (send(client_socket, buffer, len, 0) != len) {
-        perror("Send failed");
+    if (len < 0 || send(client_socket, buffer, len, 0) != len) {
+        perror("Send public key failed");
         BN_free(client_pubkey);
         dh_session_clear(&session);
+        BN_free(p);
+        BN_free(g);
         close(client_socket);
         free(data);
         return NULL;
     }
-    
-    printf("Sent public key to client\n");
     
     // 计算共享密钥
     if (dh_compute_shared_secret(&session, client_pubkey) != 0) {
-        fprintf(stderr, "Failed to compute shared secret\n");
+        fprintf(stderr, "Compute shared secret failed\n");
         BN_free(client_pubkey);
         dh_session_clear(&session);
+        BN_free(p);
+        BN_free(g);
         close(client_socket);
         free(data);
         return NULL;
     }
     
-    print_hex("Shared secret", session.shared_secret);
+    // 派生加密密钥
+    DerivedKeys keys;
+    const unsigned char salt[] = "StaticSaltForDemo";
+    if (dh_derive_keys(session.shared_secret, salt, sizeof(salt)-1, &keys) != 0) {
+        fprintf(stderr, "Key derivation failed\n");
+    } else {
+        printf("Key exchange successful with %s\n", client_ip);
+    }
     
     // 清理
     BN_free(client_pubkey);
@@ -119,7 +111,6 @@ void *handle_client(void *arg) {
     close(client_socket);
     free(data);
     
-    printf("Client %s:%d disconnected\n", client_ip, ntohs(data->client_addr.sin_port));
     return NULL;
 }
 
@@ -151,7 +142,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
     
-    printf("Server listening on port %d...\n", PORT);
+    printf("Server listening on port %d\n", PORT);
     
     while (1) {
         // 接受新连接
