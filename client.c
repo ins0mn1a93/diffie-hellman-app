@@ -57,7 +57,7 @@ int main() {
     }
     
     print_hex("Client private key", session.private_key);
-    // print_hex("Client public key", session.public_key);
+    print_hex("Client public key", session.public_key);
     
     // 序列化并发送公钥
     char buffer[BUFFER_SIZE];
