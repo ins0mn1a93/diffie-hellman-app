@@ -7,11 +7,11 @@ TARGET_SERVER = server
 TARGET_CLIENT = client
 
 # 服务端的源文件
-SRC_SERVER = src/diffie_hellman.c src/server.c
+SRC_SERVER = ./diffie_hellman.c ./server.c
 OBJ_SERVER = $(SRC_SERVER:.c=.o)
 
 # 客户端的源文件
-SRC_CLIENT = src/diffie_hellman.c src/client.c
+SRC_CLIENT = ./diffie_hellman.c ./client.c
 OBJ_CLIENT = $(SRC_CLIENT:.c=.o)
 
 # 默认目标
@@ -31,4 +31,4 @@ $(TARGET_CLIENT): $(OBJ_CLIENT)
 
 # 清理中间文件
 clean:
-	rm -f src/*.o $(TARGET_SERVER) $(TARGET_CLIENT)
+	rm -f ./*.o $(TARGET_SERVER) $(TARGET_CLIENT)
